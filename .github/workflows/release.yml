@@ -6,7 +6,7 @@ name: release
 # a numbered release with a changelog.
 # Can also be run from the Actions tab (workflow_dispatch) for a dry-run rebuild.
 #
-# Pipeline: verify (full CI) -> cross-platform standalone binaries (Bun) ->
+# Pipeline: verify (full CI) -> cross-platform standalone binaries (Bun + nexe) ->
 # GitHub Release with SHA256SUMS + auto-generated notes -> npm publish
 # (tag pushes only, when an NPM_TOKEN secret is configured).
 on:
@@ -89,10 +89,8 @@ jobs:
       - run: npm ci
       - run: npm run ci # typecheck -> lint -> test -> build
 
-  # One artifact per OS/arch. Bun cross-compiles every target from a single
-  # Linux host, so the whole matrix runs without macOS/Windows runners.
-  # Includes legacy 32-bit (x86) and ARMv7 targets for older hardware.
-  binaries:
+  # Modern 64-bit targets compiled with Bun (fast, native binaries).
+  binaries-bun:
     name: build ${{ matrix.name }}
     needs: [prepare, verify]
     runs-on: ubuntu-latest
@@ -104,10 +102,7 @@ jobs:
           - { target: bun-darwin-x64, name: pentesterflow-darwin-x64 }
           - { target: bun-linux-x64, name: pentesterflow-linux-x64 }
           - { target: bun-linux-arm64, name: pentesterflow-linux-arm64 }
-          - { target: bun-linux-x86, name: pentesterflow-linux-x86 }
           - { target: bun-windows-x64, name: pentesterflow-windows-x64.exe }
-          - { target: bun-windows-x86, name: pentesterflow-windows-x86.exe }
-          - { target: bun-linux-armv7, name: pentesterflow-linux-armv7 }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -126,9 +121,6 @@ jobs:
           else
             VER="main-${GITHUB_SHA::7}"
           fi
-          # The Bun-compiled binary doesn't run tsup's --define, so it reads
-          # the FALLBACK in version.ts. Patch it to the release version so
-          # `pentesterflow --version` reports correctly. No-op if unmatched.
           sed -i "s/const FALLBACK = 'dev';/const FALLBACK = '${VER}';/" src/version/version.ts
       - name: Compile standalone binary
         run: |
@@ -146,10 +138,67 @@ jobs:
           path: dist-bin/*
           if-no-files-found: error
 
+  # Legacy 32-bit (x86) and ARMv7 targets compiled with nexe.
+  # nexe bundles the Node.js runtime with the app so it works on older hardware
+  # that Bun does not support.
+  binaries-legacy:
+    name: build ${{ matrix.name }}
+    needs: [prepare, verify]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { node_arch: x86, os: ubuntu-latest, name: pentesterflow-linux-x86 }
+          - { node_arch: x86, os: windows-latest, name: pentesterflow-windows-x86.exe }
+          - { node_arch: armv7l, os: ubuntu-latest, name: pentesterflow-linux-armv7 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          architecture: ${{ matrix.node_arch }}
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Stamp version into the binary
+        shell: bash
+        run: |
+          RELEASE_TAG="${{ needs.prepare.outputs.release_tag }}"
+          if [[ "${RELEASE_TAG}" == v* ]]; then
+            VER="${RELEASE_TAG#v}"
+          else
+            VER="main-${GITHUB_SHA::7}"
+          fi
+          sed -i "s/const FALLBACK = 'dev';/const FALLBACK = '${VER}';/" src/version/version.ts || \
+            sed -i.bak "s/const FALLBACK = 'dev';/const FALLBACK = '${VER}';/" src/version/version.ts
+      - name: Compile standalone binary (nexe)
+        run: |
+          mkdir -p dist-bin
+          npx nexe dist/cli.js \
+            --target "${{ matrix.node_arch }}" \
+            --output "dist-bin/${{ matrix.name }}" \
+            --verbose
+      - name: Checksum (Linux)
+        if: runner.os == 'Linux'
+        run: cd dist-bin && sha256sum "${{ matrix.name }}" > "${{ matrix.name }}.sha256"
+      - name: Checksum (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cd dist-bin
+          $hash = Get-FileHash -Path "${{ matrix.name }}" -Algorithm SHA256
+          "$($hash.Hash)  ${{ matrix.name }}" | Out-File -FilePath "${{ matrix.name }}.sha256"
+        shell: pwsh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist-bin/*
+          if-no-files-found: error
+
   # Collect every binary + a combined SHA256SUMS into one GitHub Release.
   release:
     name: github release
-    needs: [prepare, binaries]
+    needs: [prepare, binaries-bun, binaries-legacy]
     if: needs.prepare.outputs.should_publish_release == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -185,7 +234,7 @@ jobs:
 
   dry-run:
     name: dry-run artifacts
-    needs: [prepare, binaries]
+    needs: [prepare, binaries-bun, binaries-legacy]
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
